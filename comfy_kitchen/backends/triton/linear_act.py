@@ -28,7 +28,7 @@ import triton
 import triton.language as tl
 
 # Every autotune config below tiles K evenly when K_MULTIPLE holds. N tiles
-# that run past N are masked (EVEN_N below), so BN need not divide N.
+# that run past N are masked (even_n below), so BN need not divide N.
 N_MULTIPLE = 128
 K_MULTIPLE = 64
 # Below this many rows the GEMM is too small for the fused kernel to be worth
@@ -38,17 +38,17 @@ MIN_M = 256
 _CONFIGS = [
     # Tuned on NVIDIA RTX 5090 (sm_120, ~99 KB shared memory per block) for the
     # Wan2.1-1.3B FFN up projection (M 28080, K 1536, N 8960, fp16).
-    triton.Config({"BM": 128, "BN": 128, "BK": 64, "GROUP_M": 8}, num_warps=4, num_stages=2),
+    triton.Config({"block_m": 128, "block_n": 128, "block_k": 64, "group_size_m": 8}, num_warps=4, num_stages=2),
     # Smaller-footprint configs so the kernel also runs where shared memory / LDS
     # is tighter (e.g. 64 KB on AMD GPUs). Not tuned on any particular GPU.
-    triton.Config({"BM": 128, "BN": 128, "BK": 32, "GROUP_M": 8}, num_warps=4, num_stages=2),
-    triton.Config({"BM": 64, "BN": 128, "BK": 64, "GROUP_M": 8}, num_warps=4, num_stages=2),
-    triton.Config({"BM": 128, "BN": 64, "BK": 32, "GROUP_M": 8}, num_warps=4, num_stages=2),
-    triton.Config({"BM": 128, "BN": 128, "BK": 32, "GROUP_M": 8}, num_warps=8, num_stages=2),
+    triton.Config({"block_m": 128, "block_n": 128, "block_k": 32, "group_size_m": 8}, num_warps=4, num_stages=2),
+    triton.Config({"block_m": 64, "block_n": 128, "block_k": 64, "group_size_m": 8}, num_warps=4, num_stages=2),
+    triton.Config({"block_m": 128, "block_n": 64, "block_k": 32, "group_size_m": 8}, num_warps=4, num_stages=2),
+    triton.Config({"block_m": 128, "block_n": 128, "block_k": 32, "group_size_m": 8}, num_warps=8, num_stages=2),
     # Tuned on AMD Radeon AI PRO R9700 (gfx1201, 64 KB LDS) for the Wan2.1 shape
     # above. BN 256 does not divide every served N (N % 128 == 0); partial N tiles
     # are masked.
-    triton.Config({"BM": 128, "BN": 256, "BK": 32, "GROUP_M": 8}, num_warps=8, num_stages=1),
+    triton.Config({"block_m": 128, "block_n": 256, "block_k": 32, "group_size_m": 8}, num_warps=8, num_stages=1),
 ]
 
 
@@ -72,54 +72,54 @@ def _gelu_tanh(x):
     return x / (1.0 + tl.math.exp2(-2.8853900817779268 * u))
 
 
-@triton.autotune(configs=_CONFIGS, key=["M", "N", "K"])
-# EVEN_N follows the BN of whichever config the autotuner runs; when BN divides
+@triton.autotune(configs=_CONFIGS, key=["m", "n", "k"])
+# even_n follows the BN of whichever config the autotuner runs; when BN divides
 # N the kernel compiles without the N wrap and mask.
-@triton.heuristics({"EVEN_N": lambda args: args["N"] % args["BN"] == 0})
+@triton.heuristics({"even_n": lambda args: args["n"] % args["block_n"] == 0})
 @triton.jit
 def _linear_gelu_tanh_kernel(
     x_ptr, w_ptr, b_ptr, o_ptr,
-    M, N, K,
+    m, n, k,
     stride_xm, stride_wn, stride_om,
-    HAS_BIAS: tl.constexpr, EVEN_N: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP_M: tl.constexpr,
+    has_bias: tl.constexpr, even_n: tl.constexpr,
+    block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr, group_size_m: tl.constexpr,
 ):
-    # Grouped tile order: GROUP_M row tiles sweep the N tiles together for L2 reuse.
+    # Grouped tile order: group_size_m row tiles sweep the N tiles together for L2 reuse.
     pid = tl.program_id(0)
-    num_m = tl.cdiv(M, BM)
-    num_n = tl.cdiv(N, BN)
-    group = GROUP_M * num_n
+    num_m = tl.cdiv(m, block_m)
+    num_n = tl.cdiv(n, block_n)
+    group = group_size_m * num_n
     gid = pid // group
-    first_m = gid * GROUP_M
-    gsz = tl.minimum(num_m - first_m, GROUP_M)
+    first_m = gid * group_size_m
+    gsz = tl.minimum(num_m - first_m, group_size_m)
     pm = first_m + (pid % group) % gsz
     pn = (pid % group) // gsz
 
-    rm = pm * BM + tl.arange(0, BM)
-    rn = pn * BN + tl.arange(0, BN)
-    if EVEN_N:
+    rm = pm * block_m + tl.arange(0, block_m)
+    rn = pn * block_n + tl.arange(0, block_n)
+    if even_n:
         rn_ld = rn
-        o_mask = rm[:, None] < M
+        o_mask = rm[:, None] < m
     else:
         # Last N tile runs past N: wrap its weight / bias reads onto valid rows
         # (no masks in the K loop) and drop those columns at the store.
-        rn_ld = rn % N
-        o_mask = (rm[:, None] < M) & (rn[None, :] < N)
-    rk = tl.arange(0, BK)
+        rn_ld = rn % n
+        o_mask = (rm[:, None] < m) & (rn[None, :] < n)
+    rk = tl.arange(0, block_k)
     a_p = x_ptr + rm[:, None].to(tl.int64) * stride_xm + rk[None, :]
     b_p = w_ptr + rn_ld[None, :].to(tl.int64) * stride_wn + rk[:, None]
-    m_mask = rm[:, None] < M
+    m_mask = rm[:, None] < m
 
-    acc = tl.zeros([BM, BN], tl.float32)
-    for _ in range(0, K, BK):
+    acc = tl.zeros([block_m, block_n], tl.float32)
+    for _ in range(0, k, block_k):
         a = tl.load(a_p, mask=m_mask, other=0.0)
         b = tl.load(b_p)
         acc = tl.dot(a, b, acc)
-        a_p += BK
-        b_p += BK
+        a_p += block_k
+        b_p += block_k
 
     dt = o_ptr.dtype.element_ty
-    if HAS_BIAS:
+    if has_bias:
         acc = acc + tl.load(b_ptr + rn_ld).to(tl.float32)[None, :]
     o = _gelu_tanh(_round_to(acc, dt)).to(dt)
     tl.store(o_ptr + rm[:, None].to(tl.int64) * stride_om + rn[None, :], o, mask=o_mask)
@@ -146,12 +146,12 @@ def linear_gelu(
     has_bias = bias is not None
 
     def grid(meta):
-        return (triton.cdiv(m, meta["BM"]) * triton.cdiv(n, meta["BN"]),)
+        return (triton.cdiv(m, meta["block_m"]) * triton.cdiv(n, meta["block_n"]),)
 
     _linear_gelu_tanh_kernel[grid](
         x2, weight, bias if has_bias else weight, out,
         m, n, k,
         x2.stride(0), weight.stride(0), out.stride(0),
-        HAS_BIAS=has_bias,
+        has_bias=has_bias,
     )
     return out.view(*x.shape[:-1], n)

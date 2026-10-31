@@ -147,7 +147,7 @@ class TestLinearGelu:
 
         tuner = linear_act._linear_gelu_tanh_kernel
         saved = tuner.configs, tuner.cache
-        tuner.configs = [triton.Config({"BM": 128, "BN": 256, "BK": 32, "GROUP_M": 8},
+        tuner.configs = [triton.Config({"block_m": 128, "block_n": 256, "block_k": 32, "group_size_m": 8},
                                        num_warps=8, num_stages=1)]
         tuner.cache = {}
         try:
