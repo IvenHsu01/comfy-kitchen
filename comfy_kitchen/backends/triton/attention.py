@@ -15,10 +15,18 @@ import torch
 import triton
 import triton.language as tl
 
-_BLOCK_M, _BLOCK_N, _NUM_WARPS, _NUM_STAGES = 128, 64, 8, 2
 _LOG2E = 1.4426950408889634
 
 
+# The tile that wins differs by GPU: (128, 64) with 8 warps on gfx1201, (128, 32) with 4 warps on RTX 5090
+# (the other one is 2-3x slower there). Both are tried at the first call per shape and the faster is kept.
+@triton.autotune(
+    configs=[
+        triton.Config({"block_m": 128, "block_n": 64}, num_warps=8, num_stages=2),
+        triton.Config({"block_m": 128, "block_n": 32}, num_warps=4, num_stages=2),
+    ],
+    key=["seq_q", "seq_k", "head_dim"],
+)
 @triton.jit
 def _flash_attention_fwd(
     q_ptr, k_ptr, v_ptr, o_ptr, qk_scale, seq_q, seq_k,
@@ -73,14 +81,16 @@ def flash_attn(
     if scale is None:
         scale = 1.0 / math.sqrt(head_dim)
     o = torch.empty((batch, seq_q, heads, head_dim), device=q.device, dtype=q.dtype)
-    grid = (triton.cdiv(seq_q, _BLOCK_M), heads, batch)
+
+    def grid(meta):
+        return (triton.cdiv(seq_q, meta["block_m"]), heads, batch)
+
     _flash_attention_fwd[grid](
         q, k, v, o, scale * _LOG2E, seq_q, seq_k,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
         o.stride(0), o.stride(1), o.stride(2),
-        block_m=_BLOCK_M, block_n=_BLOCK_N, head_dim=head_dim,
-        num_warps=_NUM_WARPS, num_stages=_NUM_STAGES,
+        head_dim=head_dim,
     )
     return o
