@@ -15,7 +15,7 @@ import torch
 import triton
 import triton.language as tl
 
-_BLOCK_M, _BLOCK_N, _NUM_WARPS, _NUM_STAGES = 128, 64, 8, 2
+_BLOCK_M, _BLOCK_N, _NUM_WARPS, _NUM_STAGES = 128, 32, 4, 2
 _LOG2E = 1.4426950408889634
 
 
